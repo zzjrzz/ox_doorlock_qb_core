@@ -4,7 +4,7 @@ if not LoadResourceFile(cache.resource, 'web/build/index.html') then
 end
 
 if not lib.checkDependency('oxmysql', '2.4.0') then return end
-if not lib.checkDependency('ox_lib', '3.30.4') then return end
+if not lib.checkDependency('ox_lib', '3.14.0') then return end
 
 lib.versionCheck('overextended/ox_doorlock')
 require 'server.convert'
@@ -12,6 +12,10 @@ require 'server.convert'
 local utils = require 'server.utils'
 local doors = {}
 
+-- Check which inventory system is being used
+local inventoryType = GetResourceState('qb-inventory') == 'started' and 'qb' or 'ox'
+local ox_inventory = inventoryType == 'ox' and exports.ox_inventory or nil
+local QBCore = inventoryType == 'qb' and exports['qb-core']:GetCoreObject() or nil
 
 local function encodeData(door)
 	local double = door.doors
@@ -161,18 +165,30 @@ local function createDoor(id, door, name)
 end
 
 local isLoaded = false
-local ox_inventory = exports.ox_inventory
 
 SetTimeout(0, function()
-	if GetPlayer then return end
-
-	function GetPlayer(_) end
+	if inventoryType == 'qb' then
+		function GetPlayer(playerId)
+			return QBCore.Functions.GetPlayer(playerId)
+		end
+	else
+		if GetPlayer then return end
+		
+		function GetPlayer(_) end
+	end
 end)
 
 function RemoveItem(playerId, item, slot)
 	local player = GetPlayer(playerId)
 
-	if player then ox_inventory:RemoveItem(playerId, item, 1, nil, slot) end
+	if player then
+		if inventoryType == 'qb' then
+			player.Functions.RemoveItem(item, 1, slot)
+			TriggerClientEvent('inventory:client:ItemBox', playerId, QBCore.Shared.Items[item], "remove")
+		else
+			ox_inventory:RemoveItem(playerId, item, 1, nil, slot)
+		end
+	end
 end
 
 ---@param player table
@@ -180,20 +196,95 @@ end
 ---@param removeItem? boolean
 ---@return string?
 function DoesPlayerHaveItem(player, items, removeItem)
-	local playerId = player.source or player.PlayerData.source
+	local playerId = player.source or (player?.PlayerData and player.PlayerData.source) or player
 
 	for i = 1, #items do
 		local item = items[i]
 		local itemName = item.name or item
-		local data = ox_inventory:Search(playerId, 'slots', itemName, item.metadata)[1]
-
-		if data and data.count > 0 then
-			if removeItem or item.remove then
-				ox_inventory:RemoveItem(playerId, itemName, 1, nil, data.slot)
+		
+		if inventoryType == 'qb' then
+			if type(player) ~= 'table' or not player.Functions then
+				player = QBCore.Functions.GetPlayer(playerId)
+				if not player then return end
 			end
+			
+			local hasItem = player.Functions.GetItemByName(itemName)
+			
+			if hasItem and hasItem.amount > 0 then
+				if removeItem or item.remove then
+					player.Functions.RemoveItem(itemName, 1)
+					TriggerClientEvent('inventory:client:ItemBox', playerId, QBCore.Shared.Items[itemName], "remove")
+				end
+				
+				return itemName
+			end
+		else
+			local data = ox_inventory:Search(playerId, 'slots', itemName, item.metadata)[1]
 
-			return itemName
+			if data and data.count > 0 then
+				if removeItem or item.remove then
+					ox_inventory:RemoveItem(playerId, itemName, 1, nil, data.slot)
+				end
+
+				return itemName
+			end
 		end
+	end
+end
+
+function GetCharacterId(player)
+	if inventoryType == 'qb' then
+		return player.PlayerData.citizenid
+	else
+		return player.charid or player.charId or player.character_id or player.characterId or player.citizenid or player.CitizenId
+	end
+end
+
+function IsPlayerInGroup(player, groups)
+	if inventoryType == 'qb' then
+		if type(groups) ~= 'table' then groups = {groups} end
+		
+		local playerJob = player.PlayerData.job
+		local playerGang = player.PlayerData.gang
+		
+		for i = 1, #groups do
+			local group = groups[i]
+			local groupType = type(group)
+			
+			if groupType == 'string' then
+				if playerJob.name == group or playerGang.name == group then
+					return true
+				end
+			elseif groupType == 'table' then
+				if playerJob.name == group[1] and playerJob.grade.level >= (group[2] or 0) then
+					return true
+				end
+				if playerGang.name == group[1] and playerGang.grade.level >= (group[2] or 0) then
+					return true
+				end
+			end
+		end
+		
+		return false
+	else
+		if type(groups) ~= 'table' then groups = {groups} end
+
+		for i = 1, #groups do
+			local group = groups[i]
+			local groupType = type(group)
+
+			if groupType == 'string' then
+				if player.job == group or player.gang == group then
+					return true
+				end
+			elseif groupType == 'table' then
+				if (player.job == group[1] and player.grade >= (group[2] or 0)) or (player.gang == group[1] and player.ganggrade >= (group[2] or 0)) then
+					return true
+				end
+			end
+		end
+
+		return false
 	end
 end
 
@@ -214,7 +305,18 @@ local function isAuthorised(playerId, door, lockpick)
 
 	if player then
 		if lockpick then
-			return DoesPlayerHaveItem(player, Config.LockpickItems)
+			if inventoryType == 'qb' then
+				for i = 1, #Config.LockpickItems do
+					local item = Config.LockpickItems[i]
+					local itemName = item.name or item
+					if player.Functions.GetItemByName(itemName) then
+						return true
+					end
+				end
+				return false
+			else
+				return DoesPlayerHaveItem(player, Config.LockpickItems)
+			end
 		end
 
 		if door.characters and table.contains(door.characters, GetCharacterId(player)) then
@@ -341,8 +443,25 @@ RegisterNetEvent('ox_doorlock:editDoorlock', function(id, data)
 end)
 
 RegisterNetEvent('ox_doorlock:breakLockpick', function()
+	local source = source
 	local player = GetPlayer(source)
-	return player and DoesPlayerHaveItem(player, Config.LockpickItems, true)
+	
+	if not player then return false end
+	
+	if inventoryType == 'qb' then
+		for i = 1, #Config.LockpickItems do
+			local item = Config.LockpickItems[i]
+			local itemName = item.name or item
+			if player.Functions.GetItemByName(itemName) then
+				player.Functions.RemoveItem(itemName, 1)
+				TriggerClientEvent('inventory:client:ItemBox', source, QBCore.Shared.Items[itemName], "remove")
+				return true
+			end
+		end
+		return false
+	else
+		return DoesPlayerHaveItem(player, Config.LockpickItems, true)
+	end
 end)
 
 lib.addCommand('doorlock', {
